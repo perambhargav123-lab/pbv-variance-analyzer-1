@@ -197,8 +197,8 @@ if uploaded_file:
     st.dataframe(data, width="stretch", hide_index=True)
 
     def gv(item, col):
-        m = data.loc[data["Line Item"].str.contains(item, case=False), col]
-        return m.values[0] if len(m) > 0 else 0
+        m = data.loc[data["Line Item"].str.strip() == item, col]
+        return float(m.values[0]) if len(m) > 0 else 0
 
     revenue_b = gv("Revenue", "Budget")
     revenue_a = gv("Revenue", "Actual")
@@ -206,16 +206,16 @@ if uploaded_file:
     cogs_a = gv("COGS", "Actual")
     gp_b = revenue_b - cogs_b
     gp_a = revenue_a - cogs_a
-    emp_b = gv("Employee", "Budget")
-    emp_a = gv("Employee", "Actual")
+    emp_b = gv("Employee Cost", "Budget")
+    emp_a = gv("Employee Cost", "Actual")
     mkt_b = gv("Marketing", "Budget")
     mkt_a = gv("Marketing", "Actual")
     opex_b = gv("Other OpEx", "Budget")
     opex_a = gv("Other OpEx", "Actual")
     dep_b = gv("Depreciation", "Budget")
     dep_a = gv("Depreciation", "Actual")
-    fin_b = gv("Finance", "Budget")
-    fin_a = gv("Finance", "Actual")
+    fin_b = gv("Finance Cost", "Budget")
+    fin_a = gv("Finance Cost", "Actual")
     oi_b = gv("Other Income", "Budget")
     oi_a = gv("Other Income", "Actual")
 
