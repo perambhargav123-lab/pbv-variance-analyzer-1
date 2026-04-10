@@ -1843,6 +1843,6 @@ Do NOT show thinking. Start with HEADLINE immediately."""
     st.divider()
     st.markdown("### 📞 Want This For Your Company?")
     st.markdown("See the full AI analysis with root cause + board memo generation in a live walkthrough.")
-    st.link_button("📅 Book a 15-Minute Live Demo", "https://www.linkedin.com/in/bhargavvenkatesh/", use_container_width=True)
+    st.link_button("📅 Book a 15-Minute Live Demo", "https://www.linkedin.com/in/bhargav-venkatesh/", use_container_width=True)
     st.divider()
     st.caption("PBV Finance | AI CFO Systems v2.0 | Agent 1: Calculator | Agent 2: Diagnostician | Agent 3: Memo Writer | Powered by Gemma 3")
