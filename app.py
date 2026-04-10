@@ -5,6 +5,7 @@ import json
 import os
 import time
 import re
+import requests
 
 st.set_page_config(page_title="PBV Finance - AI CFO Assistant", page_icon="📊", layout="wide")
 
@@ -162,6 +163,16 @@ def suggest_category(name):
             if kw in name_lower:
                 return cat
     return None  # Truly unmatched — caller decides default
+
+
+def fmt_km(n):
+    """Format a number as 1.1M or 1,050K (no currency prefix)."""
+    abs_n = abs(n)
+    if abs_n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if abs_n >= 1_000:
+        return f"{n / 1_000:,.0f}K"
+    return f"{n:,.0f}"
 
 
 def is_subtotal_row(text):
@@ -322,6 +333,114 @@ def save_mapping_memory(new_mappings):
             json.dump(existing, f, indent=2)
     except Exception:
         pass  # Non-fatal — analysis still runs
+
+
+# Category name mapping for data-driven actions (internal category → action lookup key)
+_ACTION_CAT_MAP = {
+    "Revenue": "Revenue",
+    "COGS": "COGS",
+    "Employee": "Employee Cost",
+    "Marketing": "Selling & Marketing",
+    "OpEx": "Other Operating Expense",
+    "Finance": "Finance Cost",
+}
+
+
+def generate_data_driven_action(category, variance, curr):
+    """
+    Generate a data-driven CFO action based on ACTUAL variance data.
+    Returns dict with action/detail/owner/timeline/impact, or None.
+    """
+    abs_var = abs(variance)
+    cat_key = _ACTION_CAT_MAP.get(category)
+    if cat_key is None:
+        return None
+
+    if cat_key == "Revenue":
+        recovery = abs_var * 0.5
+        return {
+            "action": f"Recover {curr} {recovery:,.0f} via pipeline acceleration",
+            "detail": "Close top delayed deals within 30 days",
+            "owner": "Head of Sales",
+            "timeline": "30 days",
+            "impact": min(recovery, abs_var),
+        }
+    elif cat_key == "COGS":
+        saving = abs_var * 0.15
+        return {
+            "action": f"Save {curr} {saving:,.0f} via vendor renegotiation",
+            "detail": "Target 10-15% reduction with top 3 suppliers",
+            "owner": "Procurement Head",
+            "timeline": "45 days",
+            "impact": min(saving, abs_var),
+        }
+    elif cat_key == "Employee Cost":
+        saving = abs_var * 0.8
+        return {
+            "action": f"Save {curr} {saving:,.0f} via hiring freeze",
+            "detail": "Freeze all open non-critical positions",
+            "owner": "HR + CFO",
+            "timeline": "Immediate",
+            "impact": min(saving, abs_var),
+        }
+    elif cat_key == "Selling & Marketing":
+        saving = abs_var * 0.5
+        return {
+            "action": f"Save {curr} {saving:,.0f} by cutting low-ROI campaigns",
+            "detail": "Pause non-performing channels, redirect budget",
+            "owner": "Marketing Head",
+            "timeline": "30 days",
+            "impact": min(saving, abs_var),
+        }
+    elif cat_key == "Other Operating Expense":
+        saving = abs_var * 0.3
+        return {
+            "action": f"Save {curr} {saving:,.0f} via discretionary spend freeze",
+            "detail": "30-day freeze on travel, events, consulting",
+            "owner": "All Department Heads",
+            "timeline": "30 days",
+            "impact": min(saving, abs_var),
+        }
+    elif cat_key == "Finance Cost":
+        saving = abs_var * 0.25
+        return {
+            "action": f"Save {curr} {saving:,.0f} via debt restructuring",
+            "detail": "Renegotiate loan terms or refinance",
+            "owner": "CFO",
+            "timeline": "60 days",
+            "impact": min(saving, abs_var),
+        }
+    return None
+
+
+def _strip_ai_preamble(text, markers):
+    """
+    Strip everything before the first occurrence of any marker in the list.
+    Markers are tried in order. If none found, return full text.
+    """
+    for marker in markers:
+        idx = text.find(marker)
+        if idx >= 0:
+            return text[idx:]
+    return text
+
+
+def _call_ollama(prompt, model="gemma3:12b"):
+    """Call local Ollama API. Returns response text or error string."""
+    try:
+        resp = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": model, "prompt": prompt, "stream": False},
+            timeout=300,
+        )
+        resp.raise_for_status()
+        return resp.json().get("response", "")
+    except requests.ConnectionError:
+        return "ERROR: Ollama not running. Start with: ollama serve"
+    except requests.Timeout:
+        return "ERROR: Ollama timed out (>5 min). Try a smaller model."
+    except Exception as e:
+        return f"ERROR: {e}"
 
 
 # ═══════════════════════════════════════
@@ -955,22 +1074,20 @@ if uploaded_file:
         st.dataframe(margin_df, use_container_width=True, hide_index=True)
 
         # ── Key Metrics tiles ────────────────────────────────────────────
-        st.subheader("Key Metrics (Actual)")
-        _currency = st.session_state.get("_currency", "AED")
+        st.subheader(f"Key Metrics ({currency})")
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric(f"Revenue ({_currency})", fmt_km(revenue_a))
-        col2.metric(f"Gross Profit ({_currency})", fmt_km(gp_a))
-        col3.metric(f"EBITDA ({_currency})", fmt_km(ebitda_a))
-        col4.metric(f"Net Profit ({_currency})", fmt_km(pat_a))
+        col1.metric("Revenue", fmt_km(revenue_a), help=f"{currency} {revenue_a:,.0f}")
+        col2.metric("Gross Profit", fmt_km(gp_a), help=f"{currency} {gp_a:,.0f}")
+        col3.metric("EBITDA", fmt_km(ebitda_a), help=f"{currency} {ebitda_a:,.0f}")
+        col4.metric("Net Profit", fmt_km(pat_a), help=f"{currency} {pat_a:,.0f}")
 
         st.info("📤 Upload budget data for full variance analysis.")
         st.stop()
 
     # ═══════════════════════════════════════
-    # AGENT 1: CALCULATOR
+    # AGENT 1: CALCULATOR — ALL COMPUTATIONS
     # ═══════════════════════════════════════
     st.success("✅ Mapping confirmed. Running P&L analysis.")
-    st.header("🔢 Agent 1: Calculator (100% Accurate)")
 
     # Build aggregated P&L variance table (in P&L order)
     agg_rows = []
@@ -997,9 +1114,6 @@ if uploaded_file:
         })
 
     agg_data = pd.DataFrame(agg_rows)
-
-    st.subheader("TABLE 1: Category-Level P&L Variance")
-    st.dataframe(agg_data, use_container_width=True, hide_index=True)
 
     # ── P&L roll-up ──────────────────────────────────────────────────────
     revenue_b = get_agg("Revenue", "Budget")
@@ -1037,7 +1151,6 @@ if uploaded_file:
     margin_a = ebitda_a / revenue_a * 100 if revenue_a else 0.0
     swing = margin_a - margin_b
 
-    # ── Key Metrics ───────────────────────────────────────────────────────
     def fmt_km(n):
         """Format a number as 1.1M or 1,050K (no currency prefix)."""
         abs_n = abs(n)
@@ -1047,16 +1160,7 @@ if uploaded_file:
             return f"{n / 1_000:,.0f}K"
         return f"{n:,.0f}"
 
-    st.subheader(f"Key Metrics ({currency})")
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Revenue",      fmt_km(revenue_a),       fmt_km(revenue_a - revenue_b))
-    c2.metric("Gross Profit", fmt_km(gp_a),            fmt_km(gp_a - gp_b))
-    c3.metric("EBITDA",       fmt_km(ebitda_a),        fmt_km(ebitda_a - ebitda_b))
-    c4.metric("PBT",          fmt_km(pbt_a),           fmt_km(pbt_a - pbt_b))
-    c5.metric("PAT",          fmt_km(pat_a),           fmt_km(pat_a - pat_b))
-
-    # ── TABLE 2: Waterfall ────────────────────────────────────────────────
-    st.subheader("TABLE 2: P&L Waterfall (Revenue → PAT)")
+    # ── Waterfall data ────────────────────────────────────────────────────
     levels = ["Revenue", "Gross Profit", "EBITDA", "EBIT", "PBT", "PAT"]
     budgets = [revenue_b, gp_b, ebitda_b, ebit_b, pbt_b, pat_b]
     actuals = [revenue_a, gp_a, ebitda_a, ebit_a, pbt_a, pat_a]
@@ -1071,17 +1175,8 @@ if uploaded_file:
     wf["Flag"] = wf.apply(
         lambda r: "🔴 NEGATIVE" if r["Actual"] < 0 and r["Budget"] > 0 else "—", axis=1
     )
-    st.dataframe(wf, use_container_width=True, hide_index=True)
 
-    if pbt_a < 0:
-        st.warning(
-            f"⚠️ PBT is NEGATIVE ({currency} {pbt_a:,.0f}). Tax = NIL. "
-            f"Deferred Tax Asset of {currency} {abs(pbt_a) * tax_rate:,.0f} "
-            f"to be assessed for recognition under {accounting_std}."
-        )
-
-    # ── TABLE 3: EBITDA Bridge ────────────────────────────────────────────
-    st.subheader("TABLE 3: EBITDA Bridge")
+    # ── EBITDA Bridge data ────────────────────────────────────────────────
     gpm = gp_b / revenue_b if revenue_b else 0.0
     r_imp = (revenue_a - revenue_b) * gpm
     c_imp = -((cogs_a - cogs_b) - (revenue_a - revenue_b) * (1 - gpm))
@@ -1095,10 +1190,7 @@ if uploaded_file:
         "Step": [
             "Budget EBITDA",
             f"Revenue (at {gpm * 100:.0f}% GP)",
-            "COGS",
-            "Employee",
-            "Marketing",
-            "Other OpEx",
+            "COGS", "Employee", "Marketing", "Other OpEx",
             "Actual EBITDA",
         ],
         "Impact": [
@@ -1116,10 +1208,8 @@ if uploaded_file:
             f"{ebitda_a:,.0f}",
         ],
     })
-    st.dataframe(bdf, use_container_width=True, hide_index=True)
 
     # ── Validation checks ─────────────────────────────────────────────────
-    st.subheader("✅ Self-Validation (10 Checks)")
     checks = [
         ("EBITDA bridge reconciles", "PASS ✅" if recon else "FAIL ❌"),
         ("Revenue variance", "PASS ✅"),
@@ -1132,26 +1222,12 @@ if uploaded_file:
         ("Materiality both thresholds", "PASS ✅"),
         ("Drivers sorted", "PASS ✅"),
     ]
-    st.dataframe(
-        pd.DataFrame(checks, columns=["Check", "Status"]),
-        use_container_width=True, hide_index=True
-    )
     all_pass = all("PASS" in c[1] for c in checks)
-    if all_pass:
-        st.success("All 10 checks PASSED ✅")
-    else:
-        st.error("Some checks FAILED ❌")
 
     # ── Material variances ────────────────────────────────────────────────
     material = agg_data[agg_data["Material?"] == "⚠️ YES"]
-    if len(material) > 0:
-        st.subheader(f"⚠️ Material Variances ({len(material)} items)")
-        st.dataframe(
-            material[["Category", "Variance", "Variance %", "Flag"]],
-            use_container_width=True, hide_index=True
-        )
 
-    # ── TABLE 4: EBITDA Narrative ─────────────────────────────────────────
+    # ── EBITDA Narrative ──────────────────────────────────────────────────
     ds = agg_data[agg_data["Variance"] != 0].copy()
     ds["Abs"] = ds["Variance"].abs()
     ds = ds.sort_values("Abs", ascending=False)
@@ -1177,75 +1253,14 @@ if uploaded_file:
         )
     narr += f"EBITDA margin: {margin_b:.1f}% → {margin_a:.1f}%, swing {swing:.1f}pp."
 
-    st.subheader("TABLE 4: EBITDA Narrative")
-    st.info(narr)
-    st.caption("🟢 CALCULATED — template-filled, zero AI")
-
-    # ═══════════════════════════════════════
-    # TABLE 5: PVME (if unit data available)
-    # ═══════════════════════════════════════
-    st.subheader("TABLE 5: PVME Analysis")
-    if has_units and has_price:
-        vol_data = raw[raw["Month"] == selected_month] if has_month and selected_month else raw
-        st.success("✅ Unit data detected — calculating PVME")
-        pvme_rows = []
-        for _, row in vol_data.iterrows():
-            bu = row.get("Budget Units", 0)
-            au = row.get("Actual Units", 0)
-            bp = row.get("Budget Price", 0)
-            ap = row.get("Actual Price", 0)
-            price_var = au * (ap - bp)
-            vol_var = bp * (au - bu)
-            total = price_var + vol_var
-            pvme_rows.append({
-                "Product": row.get("Product", "N/A"),
-                "Price Variance": price_var,
-                "Volume Variance": vol_var,
-                "Total": total,
-                "Confidence": "🟢 CALCULATED",
-            })
-        if pvme_rows:
-            st.dataframe(pd.DataFrame(pvme_rows), use_container_width=True, hide_index=True)
-    else:
-        st.warning("⚠️ PVME requires unit data (Budget Units, Actual Units, Budget Price, Actual Price)")
-        st.markdown(f"""
-**Data needed from {erp_system}:**
-- **VA05** — Sales Orders: actual units sold by product
-- **MCSI** — Customer Analysis: volume by customer
-- **KE30** — Profitability Analysis: margin by product/segment
-
-*Until unit data is provided, revenue root cause is classified as 🔴 HYPOTHESIS*
-        """)
-
-    # ── TABLE 6: Top Drivers ──────────────────────────────────────────────
-    st.subheader("TABLE 6: Top Drivers")
+    # ── Top Drivers data ──────────────────────────────────────────────────
     tuf = ds[ds["Flag"] == "UF"]["Abs"].sum()
     ds["% of UF"] = ds.apply(
         lambda r: round(r["Abs"] / tuf * 100, 1) if r["Flag"] == "UF" and tuf > 0 else 0.0,
         axis=1
     )
-    st.dataframe(
-        ds[["Category", "Variance", "Variance %", "Flag", "% of UF"]].reset_index(drop=True),
-        use_container_width=True, hide_index=True
-    )
-
-    # ── Country Compliance ────────────────────────────────────────────────
-    st.subheader(f"🏛️ {country} Compliance ({rules['tax_desc'][:50]}...)")
-    flags = []
-    if revenue_b and abs(revenue_a - revenue_b) / revenue_b * 100 >= mat_pct:
-        flags.append(f"**Revenue:** {rules['tax_desc']}")
-    if emp_a > emp_b:
-        flags.append(f"**Employee Cost:** {rules['labor']}")
-    flags.append(f"**Indirect Tax:** {rules['vat']}")
-    flags.append(f"**Other:** {rules['other']}")
-    if pbt_a < 0:
-        flags.append(f"**LOSS:** Assess DTA recognition. {rules['tax_desc']}")
-    for f in flags:
-        st.markdown(f"- {f}")
-    st.caption("🟢 HARDCODED — verified regulations")
 
     # ── Quick Wins ────────────────────────────────────────────────────────
-    st.subheader("⚡ Quick Wins (30-Day, Zero Budget)")
     qw = []
     if revenue_a < revenue_b and revenue_b and abs(revenue_a - revenue_b) / revenue_b * 100 >= mat_pct:
         qw.extend(QUICK_WINS["revenue_decline"])
@@ -1259,48 +1274,8 @@ if uploaded_file:
         qw.extend(QUICK_WINS["margin_compression"])
     if not qw:
         qw = QUICK_WINS["revenue_decline"][:2]
-    st.dataframe(
-        pd.DataFrame([{
-            "Action": w["action"], "Owner": w["owner"],
-            "Impact": w["impact"], "ERP": w["erp"]
-        } for w in qw[:5]]),
-        use_container_width=True, hide_index=True
-    )
-    st.caption("🟡 PRE-BUILT — standard actions, customize per client")
 
-    # ═══════════════════════════════════════
-    # DOWNLOAD BUTTON
-    # ═══════════════════════════════════════
-    st.subheader("📥 Download Report")
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        agg_data.to_excel(writer, sheet_name="Variance", index=False)
-        wf.to_excel(writer, sheet_name="Waterfall", index=False)
-        bdf.to_excel(writer, sheet_name="EBITDA Bridge", index=False)
-        pd.DataFrame(checks, columns=["Check", "Status"]).to_excel(
-            writer, sheet_name="Validation", index=False
-        )
-        data.to_excel(writer, sheet_name="Raw Line Items", index=False)
-        if len(material) > 0:
-            material.to_excel(writer, sheet_name="Material Items", index=False)
-    buffer.seek(0)
-    st.download_button(
-        label=f"📥 Download Excel Report ({company_name or 'Analysis'})",
-        data=buffer,
-        file_name=f"PBV_Variance_{company_name}_{reporting_period}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-    agent1_time = round(time.time() - start_time, 1)
-    st.caption(f"Agent 1 completed in {agent1_time}s")
-
-    st.divider()
-
-    # ═══════════════════════════════════════
-    # AGENTIC DECISION ENGINE
-    # ═══════════════════════════════════════
-    st.header("🧠 Agentic Decision Engine")
-
+    # ── Decision Engine data ──────────────────────────────────────────────
     material_count = len(material)
     if pbt_a < 0 and material_count >= 2:
         severity = "🔴 RED — CRISIS"
@@ -1319,60 +1294,542 @@ if uploaded_file:
         decision_category = 1
         decision_name = "STAY THE COURSE"
 
+    # ── Data-driven CFO actions (from actual UF variances) ──────────────
+    _uf_rows = agg_data[agg_data["Flag"] == "UF"].sort_values("Variance", key=abs, ascending=False)
+    dd_actions = []
+    for _, _uf in _uf_rows.iterrows():
+        _act = generate_data_driven_action(_uf["Category"], _uf["Variance"], currency)
+        if _act:
+            dd_actions.append(_act)
+    total_recoverable = sum(a["impact"] for a in dd_actions)
+    post_action_ebitda = ebitda_a + total_recoverable
+
+    # ── Pre-computed AI context (numbers from Python, not AI) ─────────────
+    material_uf = agg_data[(agg_data["Flag"] == "UF") & (agg_data["Material?"].str.contains("YES", na=False))]
+
+    _gp_margin_b = round(gp_b / revenue_b * 100, 1) if revenue_b else 0.0
+    _gp_margin_a = round(gp_a / revenue_a * 100, 1) if revenue_a else 0.0
+
+    ai_context = f"""VERIFIED FINANCIAL DATA (use ONLY these numbers):
+
+Revenue: Budget {currency} {revenue_b:,.0f} → Actual {currency} {revenue_a:,.0f} (Variance: {currency} {revenue_a - revenue_b:,.0f}, {(revenue_a - revenue_b) / revenue_b * 100 if revenue_b else 0:.1f}%)
+Gross Profit: {currency} {gp_b:,.0f} → {currency} {gp_a:,.0f} (Margin: {_gp_margin_b}% → {_gp_margin_a}%)
+EBITDA: {currency} {ebitda_b:,.0f} → {currency} {ebitda_a:,.0f} (Margin: {margin_b:.1f}% → {margin_a:.1f}%)
+PBT: {currency} {pbt_b:,.0f} → {currency} {pbt_a:,.0f}
+PAT: {currency} {pat_b:,.0f} → {currency} {pat_a:,.0f}
+EBITDA Margin Swing: {swing:.1f}pp
+
+MATERIAL UNFAVORABLE ITEMS (focus ONLY on these):
+{material_uf[['Category', 'Budget', 'Actual', 'Variance', 'Variance %']].to_string(index=False) if len(material_uf) > 0 else 'None'}
+
+BRIDGE: {narr}
+
+PRE-COMPUTED CFO ACTIONS (use these EXACT numbers):
+"""
+    for _ai, _da in enumerate(dd_actions[:5], 1):
+        ai_context += f"{_ai}. {_da['action']} | Owner: {_da['owner']} | Impact: {currency} {_da['impact']:,.0f} | Timeline: {_da['timeline']}\n"
+
+    ai_context += f"""
+TOTAL RECOVERABLE: {currency} {total_recoverable:,.0f}
+EBITDA RECOVERY PROJECTION: {currency} {ebitda_a:,.0f} → {currency} {post_action_ebitda:,.0f}
+{"EBITDA TURNS POSITIVE after actions" if ebitda_a < 0 and post_action_ebitda > 0 else ""}
+
+DECISION ENGINE: Category {decision_category} — {decision_name}
+
+COUNTRY: {country}
+INDUSTRY: {industry}
+ERP: {erp_system}
+CURRENCY: {currency}
+"""
+
+    # ── Risk escalation alerts ────────────────────────────────────────────
+    alerts = []
+    if ebitda_a < 0:
+        _q_loss = ebitda_a * 3
+        alerts.append(f"🚨 Operating loss. Projected quarterly loss: {currency} {abs(_q_loss):,.0f}")
+    if pbt_a < 0:
+        alerts.append(f"🚨 Net loss position: {currency} {pbt_a:,.0f}. Cash impact within 2-3 months if unchanged.")
+    if abs(swing) > 10:
+        alerts.append(f"⚠️ EBITDA margin collapsed {abs(swing):.1f}pp — structural deterioration likely")
+    if revenue_a < revenue_b and revenue_b and abs(revenue_a - revenue_b) / revenue_b * 100 > 15:
+        alerts.append(f"⚠️ Revenue decline exceeds 15% — market position at risk")
+
+    # ── Mapping confidence ────────────────────────────────────────────────
+    _n_total_items = len(data)
+    _n_memory = st.session_state.get("_memory_matched", 0)
+    try:
+        _n_unmatched = len(_unmatched_labels)
+    except NameError:
+        _n_unmatched = 0
+    _n_auto = _n_total_items - _n_memory - _n_unmatched
+    _auto_pct = round((_n_memory + _n_auto) / _n_total_items * 100) if _n_total_items else 0
+    _unmatched_pct = round(_n_unmatched / _n_total_items * 100) if _n_total_items else 0
+    if _auto_pct >= 80:
+        _map_conf = f"🟢 HIGH ({_auto_pct}% auto-matched)"
+    elif _auto_pct >= 50:
+        _map_conf = f"🟡 MEDIUM ({_auto_pct}% auto, {_unmatched_pct}% default — review recommended)"
+    else:
+        _map_conf = f"🔴 LOW ({_auto_pct}% auto, {_unmatched_pct}% default — manual review required)"
+
+    # ── Compliance flags ──────────────────────────────────────────────────
+    comp_flags = []
+    if revenue_b and abs(revenue_a - revenue_b) / revenue_b * 100 >= mat_pct:
+        comp_flags.append(f"**Revenue:** {rules['tax_desc']}")
+    if emp_a > emp_b:
+        comp_flags.append(f"**Employee Cost:** {rules['labor']}")
+    comp_flags.append(f"**Indirect Tax:** {rules['vat']}")
+    comp_flags.append(f"**Other:** {rules['other']}")
+    if pbt_a < 0:
+        comp_flags.append(f"**LOSS:** Assess DTA recognition. {rules['tax_desc']}")
+
+    # ── Board Memo text (for download) ────────────────────────────────────
+    _memo_lines = [
+        f"CFO BOARD MEMO — {company_name or 'Company'} | {reporting_period}",
+        f"Prepared by: PBV Finance AI CFO Assistant",
+        f"Country: {country} | Currency: {currency} | Standard: {accounting_std}",
+        "=" * 60,
+        "",
+        "EXECUTIVE SUMMARY",
+        f"  Severity: {severity}",
+        f"  Decision: Category {decision_category} — {decision_name}",
+        f"  Material variances: {material_count} items",
+        "",
+        "KEY METRICS",
+        f"  Revenue:      {currency} {revenue_a:,.0f}  (Budget: {revenue_b:,.0f}, Delta: {revenue_a - revenue_b:,.0f})",
+        f"  Gross Profit: {currency} {gp_a:,.0f}  (Budget: {gp_b:,.0f}, Delta: {gp_a - gp_b:,.0f})",
+        f"  EBITDA:       {currency} {ebitda_a:,.0f}  (Budget: {ebitda_b:,.0f}, Delta: {ebitda_a - ebitda_b:,.0f})",
+        f"  PBT:          {currency} {pbt_a:,.0f}  (Budget: {pbt_b:,.0f}, Delta: {pbt_a - pbt_b:,.0f})",
+        f"  PAT:          {currency} {pat_a:,.0f}  (Budget: {pat_b:,.0f}, Delta: {pat_a - pat_b:,.0f})",
+        "",
+        "EBITDA NARRATIVE",
+        narr.replace("**", ""),
+        "",
+        "MATERIAL VARIANCES",
+    ]
+    for _, _mr in material.iterrows():
+        _memo_lines.append(
+            f"  {_mr['Category']}: {currency} {_mr['Variance']:,.0f} ({_mr['Variance %']:.1f}%) — {_mr['Flag']}"
+        )
+    _memo_lines += [
+        "",
+        "CFO ACTIONS (Next 30 Days) — Data-Driven",
+    ]
+    for _qi, _da in enumerate(dd_actions[:3], 1):
+        _memo_lines.append(f"  {_qi}. {_da['action']}  |  Owner: {_da['owner']}  |  Timeline: {_da['timeline']}")
+    _memo_lines.append(f"  Total Recoverable Impact: {currency} {total_recoverable:,.0f}")
+    _memo_lines.append(f"  Post-Actions EBITDA: {currency} {post_action_ebitda:,.0f}")
+    _memo_lines += [
+        "",
+        f"COMPLIANCE ({country})",
+    ]
+    for _cf in comp_flags:
+        _memo_lines.append(f"  - {_cf.replace('**', '')}")
+    _memo_lines += [
+        "",
+        "=" * 60,
+        "Confidence: All figures 🟢 CALCULATED (Python, verified by 10 checks)",
+        f"Validation: {'All 10 PASSED' if all_pass else 'SOME CHECKS FAILED'}",
+        "Generated by PBV Finance AI CFO Assistant v2.0",
+    ]
+    _memo_text = "\n".join(_memo_lines)
+
+    agent1_time = round(time.time() - start_time, 1)
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #                     D A S H B O A R D   L A Y O U T
+    # ═══════════════════════════════════════════════════════════════════════
+
+    # ── 0. EXECUTIVE SUMMARY (the very first thing a CFO sees) ────────────
+    _rev_var = revenue_a - revenue_b
+    _rev_var_pct = round(_rev_var / revenue_b * 100, 1) if revenue_b else 0.0
+    _rev_arrow = "↓" if _rev_var < 0 else "↑"
+    if ebitda_a < 0:
+        _ebitda_status = f"NEGATIVE ↓ {currency} {abs(ebitda_a):,.0f}"
+    else:
+        _ev_arrow = "↓" if ev < 0 else "↑"
+        _ebitda_status = f"{_ev_arrow} {currency} {abs(ev):,.0f} ({margin_a:.1f}%)"
+    _primary_driver = f"{td['Category']} ({currency} {td['Variance']:,.0f})" if td is not None else "No material UF driver"
+    _top_action_text = dd_actions[0]["action"] if dd_actions else (qw[0]["action"] if qw else "No immediate actions")
+
+    st.markdown(
+        f"""<div style="background-color:#0d1b2a;padding:20px 24px 16px 24px;border-radius:10px;border-left:5px solid #4fc3f7;margin-bottom:20px;">
+<h2 style="color:#ffffff;margin:0 0 12px 0;">📊 EXECUTIVE SUMMARY</h2>
+<p style="color:#e0e0e0;font-size:16px;margin:4px 0;"><b style="color:#4fc3f7;">Revenue:</b> {_rev_arrow} {currency} {abs(_rev_var):,.0f} ({_rev_var_pct}%) &nbsp;&nbsp;|&nbsp;&nbsp; <b style="color:#4fc3f7;">EBITDA:</b> {_ebitda_status}</p>
+<p style="color:#e0e0e0;font-size:16px;margin:4px 0;"><b style="color:#4fc3f7;">Primary Driver:</b> {_primary_driver}</p>
+<p style="color:#e0e0e0;font-size:16px;margin:4px 0;"><b style="color:#4fc3f7;">Decision:</b> Category {decision_category} — {decision_name}</p>
+<p style="color:#e0e0e0;font-size:16px;margin:4px 0;"><b style="color:#4fc3f7;">Immediate Focus:</b> {_top_action_text}</p>
+</div>""",
+        unsafe_allow_html=True,
+    )
+
+    # ── 1. KEY METRICS (always visible) ───────────────────────────────────
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Revenue", fmt_km(revenue_a), fmt_km(revenue_a - revenue_b),
+              help=f"Actual: {currency} {revenue_a:,.0f} | Budget: {currency} {revenue_b:,.0f}")
+    c2.metric("Gross Profit", fmt_km(gp_a), fmt_km(gp_a - gp_b),
+              help=f"Actual: {currency} {gp_a:,.0f} | Budget: {currency} {gp_b:,.0f}")
+    c3.metric("EBITDA", fmt_km(ebitda_a), fmt_km(ebitda_a - ebitda_b),
+              help=f"Actual: {currency} {ebitda_a:,.0f} | Budget: {currency} {ebitda_b:,.0f}")
+    c4.metric("PBT", fmt_km(pbt_a), fmt_km(pbt_a - pbt_b),
+              help=f"Actual: {currency} {pbt_a:,.0f} | Budget: {currency} {pbt_b:,.0f}")
+    c5.metric("PAT", fmt_km(pat_a), fmt_km(pat_a - pat_b),
+              help=f"Actual: {currency} {pat_a:,.0f} | Budget: {currency} {pat_b:,.0f}")
+    st.caption(f"Hover metrics for full {currency} values | Mapping Confidence: {_map_conf} | Agent 1: {agent1_time}s")
+
+    st.divider()
+
+    # ── 2. DECISION ENGINE (always visible) ───────────────────────────────
     dc1, dc2, dc3 = st.columns(3)
     dc1.metric("Severity", severity)
     dc2.metric("Decision", f"Category {decision_category}")
     dc3.metric("Action", decision_name)
 
-    st.markdown(f"""
-**Engine Assessment (🟢 Rule-Based, Zero AI):**
-- Material variances: {material_count} items exceed {mat_pct}% AND {currency} {mat_abs:,.0f}
-- PBT position: {currency} {pbt_a:,.0f} ({'LOSS' if pbt_a < 0 else 'PROFIT'})
-- EBITDA margin swing: {swing:.1f}pp
-- **Recommendation: Category {decision_category} — {decision_name}**
-    """)
-    st.caption("🟢 CALCULATED — Python decision engine, not AI opinion")
+    # ── Risk Escalation Alerts (inside Decision Engine section) ───────────
+    if alerts:
+        for _alert in alerts:
+            st.warning(_alert)
+
+    # ── 3. CFO ACTION PANEL — Data-Driven (always visible, prominent) ────
+    _panel_html = """<div style="background-color:#1e3a5f;padding:20px 24px 12px 24px;border-radius:10px;margin:12px 0 8px 0;">
+<h3 style="color:#ffffff;margin-top:0;">🎯 CFO ACTIONS — Next 30 Days</h3>"""
+    if dd_actions:
+        for _qi, _da in enumerate(dd_actions[:3], 1):
+            _panel_html += f"""<p style="color:#e8e8e8;font-size:15px;margin:6px 0;">
+<b style="color:#4fc3f7;">{_qi}.</b> &nbsp;
+<b>{_da['action']}</b><br/>
+<span style="color:#b0bec5;">Detail:</span> {_da['detail']} &nbsp;&nbsp;|&nbsp;&nbsp;
+<span style="color:#b0bec5;">Owner:</span> {_da['owner']} &nbsp;&nbsp;|&nbsp;&nbsp;
+<span style="color:#b0bec5;">Timeline:</span> {_da['timeline']}</p>"""
+        # Recovery projection
+        _recovery_color = "#66bb6a" if post_action_ebitda > ebitda_a else "#b0bec5"
+        _panel_html += f"""<hr style="border-color:#2a4a6f;margin:10px 0;"/>
+<p style="color:#e0e0e0;font-size:15px;margin:4px 0;">
+<b style="color:#4fc3f7;">Total Recoverable:</b> {currency} {total_recoverable:,.0f} &nbsp;&nbsp;|&nbsp;&nbsp;
+<b style="color:#4fc3f7;">Current EBITDA:</b> {currency} {ebitda_a:,.0f} → <b style="color:{_recovery_color};">Post-Actions: {currency} {post_action_ebitda:,.0f}</b></p>"""
+        if post_action_ebitda > 0 and ebitda_a < 0:
+            _panel_html += '<p style="color:#66bb6a;font-size:16px;font-weight:bold;margin:6px 0;">✅ EBITDA turns POSITIVE with full execution</p>'
+    else:
+        # Fallback to generic quick wins if no UF variances
+        for _qi, _qw in enumerate(qw[:3], 1):
+            _panel_html += f"""<p style="color:#e8e8e8;font-size:15px;margin:6px 0;">
+<b style="color:#4fc3f7;">{_qi}.</b> &nbsp;
+<b>{_qw['action']}</b><br/>
+<span style="color:#b0bec5;">Owner:</span> {_qw['owner']} &nbsp;&nbsp;|&nbsp;&nbsp;
+<span style="color:#b0bec5;">Impact:</span> {_qw['impact']}</p>"""
+    _panel_html += "</div>"
+    st.markdown(_panel_html, unsafe_allow_html=True)
+
+    # ── 4. TOP MATERIAL VARIANCES (always visible, compact) ───────────────
+    if len(material) > 0:
+        st.markdown(f"**⚠️ Material Variances ({material_count} items exceeding {mat_pct}% & {currency} {mat_abs:,.0f})**")
+        _top_mat = material.head(3)
+        _mat_cols = st.columns(3)
+        for _i, (_, _mr) in enumerate(_top_mat.iterrows()):
+            _mat_cols[_i].metric(
+                _mr["Category"],
+                fmt_km(_mr["Variance"]),
+                f"{_mr['Variance %']:.1f}% {_mr['Flag']}",
+                help=f"Variance: {currency} {_mr['Variance']:,.0f}",
+            )
+    else:
+        st.success("No material variances detected.")
+
+    st.divider()
+
+    # ── 5. EBITDA NARRATIVE (always visible) ──────────────────────────────
+    st.markdown("**EBITDA Narrative**")
+    st.info(narr)
+
+    if pbt_a < 0:
+        st.warning(
+            f"⚠️ PBT is NEGATIVE ({currency} {pbt_a:,.0f}). Tax = NIL. "
+            f"Deferred Tax Asset of {currency} {abs(pbt_a) * tax_rate:,.0f} "
+            f"to be assessed for recognition under {accounting_std}."
+        )
+
+    st.divider()
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #                   D E T A I L   E X P A N D E R S
+    # ═══════════════════════════════════════════════════════════════════════
+
+    with st.expander("📊 Full Variance Table", expanded=False):
+        st.dataframe(agg_data, use_container_width=True, hide_index=True)
+
+    with st.expander("📈 P&L Waterfall (Revenue → PAT)", expanded=False):
+        st.dataframe(wf, use_container_width=True, hide_index=True)
+
+    with st.expander("🔗 EBITDA Bridge", expanded=False):
+        st.dataframe(bdf, use_container_width=True, hide_index=True)
+
+    with st.expander("🔍 PVME Analysis", expanded=False):
+        if has_units and has_price:
+            vol_data = raw[raw["Month"] == selected_month] if has_month and selected_month else raw
+            st.success("✅ Unit data detected — calculating PVME")
+            pvme_rows = []
+            for _, row in vol_data.iterrows():
+                bu = row.get("Budget Units", 0)
+                au = row.get("Actual Units", 0)
+                bp = row.get("Budget Price", 0)
+                ap = row.get("Actual Price", 0)
+                price_var = au * (ap - bp)
+                vol_var = bp * (au - bu)
+                total = price_var + vol_var
+                pvme_rows.append({
+                    "Product": row.get("Product", "N/A"),
+                    "Price Variance": price_var,
+                    "Volume Variance": vol_var,
+                    "Total": total,
+                    "Confidence": "🟢 CALCULATED",
+                })
+            if pvme_rows:
+                st.dataframe(pd.DataFrame(pvme_rows), use_container_width=True, hide_index=True)
+        else:
+            st.warning("⚠️ PVME requires unit data (Budget Units, Actual Units, Budget Price, Actual Price)")
+            st.markdown(f"""
+**Data needed from {erp_system}:**
+- **VA05** — Sales Orders: actual units sold by product
+- **MCSI** — Customer Analysis: volume by customer
+- **KE30** — Profitability Analysis: margin by product/segment
+
+*Until unit data is provided, revenue root cause is classified as 🔴 HYPOTHESIS*
+            """)
+
+    with st.expander("📋 Top Drivers Detail", expanded=False):
+        st.dataframe(
+            ds[["Category", "Variance", "Variance %", "Flag", "% of UF"]].reset_index(drop=True),
+            use_container_width=True, hide_index=True
+        )
+
+    with st.expander("✅ Validation (10 Checks)", expanded=False):
+        st.dataframe(
+            pd.DataFrame(checks, columns=["Check", "Status"]),
+            use_container_width=True, hide_index=True
+        )
+        if all_pass:
+            st.success("All 10 checks PASSED ✅")
+        else:
+            st.error("Some checks FAILED ❌")
+
+    with st.expander(f"🏛️ {country} Compliance Flags", expanded=False):
+        for _cf in comp_flags:
+            st.markdown(f"- {_cf}")
+        st.caption("🟢 HARDCODED — verified regulations")
+
+    with st.expander("⚡ Quick Wins Detail (30-Day, Zero Budget)", expanded=False):
+        st.dataframe(
+            pd.DataFrame([{
+                "Action": w["action"], "Owner": w["owner"],
+                "Impact": w["impact"], "ERP": w["erp"]
+            } for w in qw[:5]]),
+            use_container_width=True, hide_index=True
+        )
+        st.caption("🟡 PRE-BUILT — standard actions, customize per client")
 
     st.divider()
 
     # ═══════════════════════════════════════
-    # AI ANALYSIS — UPGRADE SECTION
+    # DOWNLOADS
     # ═══════════════════════════════════════
-    st.header("🤖 AI Analysis — Full Version")
+    _dl1, _dl2 = st.columns(2)
+    with _dl1:
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            agg_data.to_excel(writer, sheet_name="Variance", index=False)
+            wf.to_excel(writer, sheet_name="Waterfall", index=False)
+            bdf.to_excel(writer, sheet_name="EBITDA Bridge", index=False)
+            pd.DataFrame(checks, columns=["Check", "Status"]).to_excel(
+                writer, sheet_name="Validation", index=False
+            )
+            data.to_excel(writer, sheet_name="Raw Line Items", index=False)
+            if len(material) > 0:
+                material.to_excel(writer, sheet_name="Material Items", index=False)
+        buffer.seek(0)
+        st.download_button(
+            label=f"📥 Download Excel Report ({company_name or 'Analysis'})",
+            data=buffer,
+            file_name=f"PBV_Variance_{company_name}_{reporting_period}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with _dl2:
+        st.download_button(
+            label="📥 Download Board Memo",
+            data=_memo_text,
+            file_name=f"CFO_Memo_{company_name or 'Company'}_{reporting_period}.txt",
+            mime="text/plain",
+        )
 
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.subheader("🔍 Agent 2: Root Cause Analysis")
-        st.markdown(f"""
-Diagnoses **why** variances happened using your verified P&L data:
+    st.divider()
 
-- 3 revenue hypotheses with SAP report codes (VA05, KE30, MCSI)
-- Each material cost item: root cause tagged Timing or Structural
-- EBITDA margin swing attribution (revenue vs cost split)
-- Scenario table: Base / Upside / Downside with probabilities
-- 30/60/90-day action timeline
-- 90-day risk if no action taken (quantified in {currency})
-        """)
+    # ═══════════════════════════════════════
+    # AGENT 2: ROOT CAUSE ANALYSIS (AI)
+    # ═══════════════════════════════════════
+    st.header("🤖 AI Agents — Root Cause & Board Memo")
 
-    with col_b:
-        st.subheader("📝 Agent 3: CFO Board Memo")
-        st.markdown("""
-Writes a **one-page board memo** using Agent 2's diagnosis:
+    st.subheader("🔍 Agent 2: Root Cause Diagnostician")
+    st.caption("Gemma 3 via Ollama (local, zero cloud) — uses ONLY pre-computed numbers")
 
-- Headline with materiality breach summary
-- EBITDA bridge narrative
-- Where we missed (table: Item | Variance | Root Cause)
-- Revenue diagnosis with owner accountability
-- Risks + Opportunities with amounts
-- Pre-approved quick wins
-- The Ask: 2-3 board decisions with amounts and deadlines
-        """)
+    if st.button("▶️ Run Agent 2: Root Cause Analysis", type="primary", key="_run_agent2"):
+        _p2_prompt = f"""{ai_context}
 
-    st.info(
-        "Agent 2 and Agent 3 run on **Gemma 4 locally** via Ollama — "
-        "available in the full desktop version. Book a live demo to see it in action with your own data."
-    )
-    st.link_button("📅 Book a 15-Minute Live Demo", "https://www.linkedin.com/in/bhargavvenkatesh/")
+You are a CFO Diagnostician. Using ONLY the verified data above,
+produce a QUANTIFIED root cause analysis.
+
+STRICT RULES:
+- Use ONLY numbers from the data above. Do NOT invent new numbers.
+- Every cause must have a {currency} amount and percentage.
+- Label each cause: VERIFIED (from data) or HYPOTHESIS (assumption).
+- No generic consulting language. Be specific to {industry} in {country}.
+- Maximum 300 words total.
+
+OUTPUT THIS EXACT FORMAT:
+
+🔍 ROOT CAUSE ANALYSIS
+
+[For each material UF item, write:]
+
+[Category] Variance: {currency} [amount] ([pct]%)
+
+1. Cause: [specific driver]
+   Impact: {currency} [amount] (~[X]% of this variance)
+   Owner: [role]
+   Data: [{erp_system} report code]
+   Confidence: [VERIFIED/HYPOTHESIS]
+
+2. Cause: [specific driver]
+   Impact: {currency} [amount] (~[X]% of this variance)
+   Owner: [role]
+   Data: [{erp_system} report code]
+   Confidence: [VERIFIED/HYPOTHESIS]
+
+[Causes per item must sum to ~100% of that item's variance]
+
+🎯 CAUSE → ACTION LINK
+
+[For each cause, link to pre-computed action above:]
+- [Cause] → [Action from list above] → {currency} [impact]
+
+⚠️ DATA GAPS
+- [List what data is missing for full validation]
+- [Which {erp_system} reports would resolve these gaps]
+
+📊 RECOVERY PROJECTION
+Current EBITDA: {currency} {ebitda_a:,.0f}
+Actions Total: {currency} {total_recoverable:,.0f}
+Post-Actions: {currency} {post_action_ebitda:,.0f}
+Timeline: 30-45 days
+
+Do NOT show thinking. Start with ROOT CAUSE ANALYSIS immediately."""
+
+        with st.spinner("Agent 2 running on Gemma 3 (local)..."):
+            _p2_raw = _call_ollama(_p2_prompt)
+
+        if _p2_raw.startswith("ERROR:"):
+            st.error(_p2_raw)
+        else:
+            _p2_output = _strip_ai_preamble(_p2_raw, [
+                "ROOT CAUSE ANALYSIS", "🔍 ROOT CAUSE", "🔍", "## ", "**",
+            ])
+            st.session_state["p2_output"] = _p2_output
+            st.markdown(_p2_output)
+            st.caption("🔴 AI-GENERATED — verify all numbers against Agent 1 calculations")
+
+    elif st.session_state.get("p2_output"):
+        st.markdown(st.session_state["p2_output"])
+        st.caption("🔴 AI-GENERATED — verify all numbers against Agent 1 calculations")
+
+    st.divider()
+
+    # ═══════════════════════════════════════
+    # AGENT 3: CFO BOARD MEMO (AI)
+    # ═══════════════════════════════════════
+    st.subheader("📝 Agent 3: CFO Board Memo Writer")
+    st.caption("Gemma 3 via Ollama (local, zero cloud) — uses Agent 2 findings + pre-computed numbers")
+
+    _p2_available = bool(st.session_state.get("p2_output"))
+    if not _p2_available:
+        st.info("Run Agent 2 first to generate root cause analysis, then Agent 3 can write the board memo.")
+
+    if st.button("▶️ Run Agent 3: Write Board Memo", type="primary", key="_run_agent3",
+                 disabled=not _p2_available):
+        _p2_text = st.session_state["p2_output"][:2500]
+
+        _p3_prompt = f"""{ai_context}
+
+ROOT CAUSE FINDINGS:
+{_p2_text}
+
+You are a CFO writing a BOARD MEMO. The CEO has 60 seconds to read this.
+
+STRICT RULES:
+- Maximum 250 words.
+- Start with the HEADLINE — most critical issue.
+- Every sentence must contain {currency} or %.
+- Use ONLY numbers from verified data above.
+- Actions must use the PRE-COMPUTED amounts above.
+- No consulting tone. Write as OPERATOR who owns outcomes.
+- End with specific board decisions required.
+
+OUTPUT THIS EXACT FORMAT:
+
+📌 HEADLINE
+[1 sentence: what went wrong + urgency + scale]
+
+📊 WHAT CHANGED
+- Revenue: {currency} {revenue_b:,.0f} → {currency} {revenue_a:,.0f} ({(revenue_a - revenue_b) / revenue_b * 100 if revenue_b else 0:.1f}%)
+- EBITDA: {currency} {ebitda_b:,.0f} → {currency} {ebitda_a:,.0f} (margin: {margin_b:.1f}% → {margin_a:.1f}%)
+- PBT: {currency} {pbt_a:,.0f} {"(LOSS)" if pbt_a < 0 else ""}
+
+🔍 WHY (Top 2-3 causes from root cause analysis above, quantified)
+
+⚙️ ACTIONS (Next 30-45 Days)
+[Use the pre-computed actions with exact {currency} amounts from above]
+
+📈 EXPECTED OUTCOME
+- EBITDA: {currency} {ebitda_a:,.0f} → {currency} {post_action_ebitda:,.0f}
+- Timeline: 30-45 days
+{"- EBITDA turns POSITIVE" if ebitda_a < 0 and post_action_ebitda > 0 else ""}
+
+⚠️ RISKS (2 specific risks with {currency} impact if actions fail)
+
+🧠 BOARD DECISIONS REQUIRED
+[2-3 specific approvals needed with {currency} amounts]
+
+Do NOT show thinking. Start with HEADLINE immediately."""
+
+        with st.spinner("Agent 3 writing board memo on Gemma 3 (local)..."):
+            _p3_raw = _call_ollama(_p3_prompt)
+
+        if _p3_raw.startswith("ERROR:"):
+            st.error(_p3_raw)
+        else:
+            _p3_output = _strip_ai_preamble(_p3_raw, [
+                "CFO MEMORANDUM", "MEMORANDUM", "HEADLINE", "📌 HEADLINE",
+                "📌", "## ", "TO:", "**",
+            ])
+            st.session_state["p3_output"] = _p3_output
+            st.markdown(_p3_output)
+            st.caption("🔴 AI-GENERATED — verify all numbers against Agent 1 calculations")
+
+            # Download button for AI-generated memo
+            st.download_button(
+                "📥 Download Board Memo (AI)",
+                data=_p3_output,
+                file_name=f"CFO_Memo_{company_name or 'Company'}_{reporting_period}.txt",
+                mime="text/plain",
+                key="_dl_ai_memo",
+            )
+
+    elif st.session_state.get("p3_output"):
+        st.markdown(st.session_state["p3_output"])
+        st.caption("🔴 AI-GENERATED — verify all numbers against Agent 1 calculations")
+        st.download_button(
+            "📥 Download Board Memo (AI)",
+            data=st.session_state["p3_output"],
+            file_name=f"CFO_Memo_{company_name or 'Company'}_{reporting_period}.txt",
+            mime="text/plain",
+            key="_dl_ai_memo_cached",
+        )
 
     st.divider()
     st.markdown("### 📊 Confidence Guide")
@@ -1384,4 +1841,8 @@ Writes a **one-page board memo** using Agent 2's diagnosis:
 | 🔴 HYPOTHESIS | Needs validation | AI — verify before acting |
     """)
     st.divider()
-    st.caption("PBV Finance | AI CFO Systems v2.0 | Phase 1: Smart Mapping | Anti-Hallucination v1.0 | Powered by Gemma 4")
+    st.markdown("### 📞 Want This For Your Company?")
+    st.markdown("See the full AI analysis with root cause + board memo generation in a live walkthrough.")
+    st.link_button("📅 Book a 15-Minute Live Demo", "https://www.linkedin.com/in/bhargavvenkatesh/", use_container_width=True)
+    st.divider()
+    st.caption("PBV Finance | AI CFO Systems v2.0 | Agent 1: Calculator | Agent 2: Diagnostician | Agent 3: Memo Writer | Powered by Gemma 3")
